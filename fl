@@ -1,120 +1,149 @@
--- === ANTI-TAMPER DETECTOR ===
--- Запусти ПЕРВЫМ, до тампера
+-- === ANTI-TAMPER DETECTOR v2 ===
+-- Снимаем fingerprint ПОСЛЕ загрузки (экзекютор уже всё похукал)
 
 local isTampered = false
 local reasons = {}
 
--- Снимаем fingerprints оригинальных функций
-local originals = {
-    print         = clonefunction(print),
-    warn          = clonefunction(warn),
-    require       = clonefunction(require),
-    loadstring    = clonefunction(loadstring),
-    getfenv       = clonefunction(getfenv),
-    setfenv       = clonefunction(setfenv),
-    pcall         = clonefunction(pcall),
-    xpcall        = clonefunction(xpcall),
-    tostring      = clonefunction(tostring),
-    tonumber      = clonefunction(tonumber),
-    rawget        = clonefunction(rawget),
-    rawset        = clonefunction(rawset),
+-- Ждём пока экзекютор завершит свои хуки
+task.wait(0.1)
+
+-- Снимаем fingerprint метатаблицы СЕЙЧАС (базовая линия)
+local mt = getrawmetatable(game)
+local origIndexAddr    = tostring(rawget(mt, "__index"))
+local origNamecallAddr = tostring(rawget(mt, "__namecall"))
+local origNewIndexAddr = tostring(rawget(mt, "__newindex"))
+
+-- Снимаем fingerprint глобальных функций
+local env = getfenv(0)
+local originals = {}
+local identities = {}
+
+local watchList = {
+    "print", "warn", "error",
+    "require", "loadstring",
+    "pcall", "xpcall",
+    "getfenv", "setfenv",
+    "tostring", "tonumber",
+    "rawget", "rawset",
 }
 
--- Сохраняем identity (адреса) функций
-local identities = {}
-for name, func in pairs(originals) do
-    identities[name] = tostring(func)
+for _, name in ipairs(watchList) do
+    local f = rawget(env, name) or _G[name]
+    if f then
+        originals[name]   = clonefunction(f)
+        identities[name]  = tostring(f)
+    end
 end
 
--- Сохраняем метатаблицу game
-local mt = getrawmetatable(game)
-local orig_index    = clonefunction(mt.__index)
-local orig_newindex = rawget(mt, "__newindex")
-local orig_namecall = rawget(mt, "__namecall")
+print(string.format("[AntiTamper] Базовая линия установлена | __index: %s", origIndexAddr))
 
-local origIndexAddr    = tostring(orig_index)
-local origNamecallAddr = tostring(orig_namecall)
+-- ===================== ПРОВЕРКИ =====================
 
--- Функция проверки
 local function runChecks()
-    -- 1. Проверяем глобальные функции
-    local env = getfenv(0)
-    for name, originalFunc in pairs(originals) do
+    isTampered = false
+    reasons    = {}
+
+    -- 1. Глобальные функции
+    for _, name in ipairs(watchList) do
         local current = rawget(env, name) or _G[name]
-        if current and tostring(current) ~= identities[name] then
+        if current and identities[name] and tostring(current) ~= identities[name] then
             isTampered = true
-            table.insert(reasons, string.format("Функция подменена: %s (было %s, стало %s)", name, identities[name], tostring(current)))
+            table.insert(reasons, string.format(
+                "Функция подменена: %s (было %s → стало %s)",
+                name, identities[name], tostring(current)
+            ))
         end
     end
 
-    -- 2. Проверяем __index метатаблицы game
-    local newMt = getrawmetatable(game)
-    local newIndex = rawget(newMt, "__index")
-    if tostring(newIndex) ~= origIndexAddr then
+    -- 2. Метатаблица game (сравниваем с нашей базовой линией)
+    local curMt = getrawmetatable(game)
+
+    local curIndex    = tostring(rawget(curMt, "__index"))
+    local curNamecall = tostring(rawget(curMt, "__namecall"))
+    local curNewIndex = tostring(rawget(curMt, "__newindex"))
+
+    if curIndex ~= origIndexAddr then
         isTampered = true
-        table.insert(reasons, string.format("game.__index подменён (было %s, стало %s)", origIndexAddr, tostring(newIndex)))
+        table.insert(reasons, string.format(
+            "game.__index изменён после старта\n  было: %s\n  стало: %s",
+            origIndexAddr, curIndex
+        ))
     end
 
-    -- 3. Проверяем __namecall
-    local newNamecall = rawget(newMt, "__namecall")
-    if tostring(newNamecall) ~= origNamecallAddr then
+    if curNamecall ~= origNamecallAddr then
         isTampered = true
-        table.insert(reasons, string.format("game.__namecall подменён (было %s, стало %s)", origNamecallAddr, tostring(newNamecall)))
+        table.insert(reasons, string.format(
+            "game.__namecall изменён после старта\n  было: %s\n  стало: %s",
+            origNamecallAddr, curNamecall
+        ))
     end
 
-    -- 4. Проверяем hookfunction через checkcaller (если доступно)
-    if checkcaller then
-        local ok = pcall(function()
-            local dummy = function() end
-            hookfunction(dummy, function() end)
-            -- если hookfunction не бросает ошибку на защищённую функцию — подозрительно
-        end)
+    if curNewIndex ~= origNewIndexAddr then
+        isTampered = true
+        table.insert(reasons, string.format(
+            "game.__newindex изменён после старта\n  было: %s\n  стало: %s",
+            origNewIndexAddr, curNewIndex
+        ))
     end
 
-    -- 5. Проверяем getgc на наличие подозрительных замыканий
+    -- 3. getgc маркер
     if getgc then
         for _, obj in ipairs(getgc(true)) do
             if type(obj) == "table" then
-                local s = rawget(obj, "__tamper_marker")
-                if s == true then
+                if rawget(obj, "__tamper_marker") == true then
                     isTampered = true
-                    table.insert(reasons, "Найден __tamper_marker в getgc() — тампер активен")
+                    table.insert(reasons, "getgc: найден __tamper_marker в памяти")
+                end
+            end
+        end
+    end
+
+    -- 4. Проверка hookfunction на наших клонах
+    if hookfunction and islclosure then
+        for _, name in ipairs(watchList) do
+            local f = rawget(env, name) or _G[name]
+            if f and islclosure(f) then
+                -- если функция lua-closure и адрес изменился — хукнута
+                if tostring(f) ~= identities[name] then
+                    isTampered = true
+                    table.insert(reasons, string.format(
+                        "hookfunction детект: %s", name
+                    ))
                 end
             end
         end
     end
 end
 
--- Запускаем
-runChecks()
+-- ===================== ВЫВОД =====================
 
--- Вывод результата
-if isTampered then
-    warn("╔══════════════════════════════════╗")
-    warn("║   ⚠️  ТАМПЕР ОБНАРУЖЕН!          ║")
-    warn("╚══════════════════════════════════╝")
-    for i, reason in ipairs(reasons) do
-        warn(string.format("  [%d] %s", i, reason))
+local function printResult(realtime)
+    local prefix = realtime and "[AntiTamper RT]" or "[AntiTamper]"
+    if isTampered then
+        warn(prefix .. " ╔══════════════════════════════════╗")
+        warn(prefix .. " ║   ⚠️  ТАМПЕР ОБНАРУЖЕН!          ║")
+        warn(prefix .. " ╚══════════════════════════════════╝")
+        for i, r in ipairs(reasons) do
+            warn(string.format("%s   [%d] %s", prefix, i, r))
+        end
+    else
+        if realtime then return end -- не спамим в консоль если всё чисто
+        print(prefix .. " ╔══════════════════════════════════╗")
+        print(prefix .. " ║   ✅ ТАМПЕР НЕ ОБНАРУЖЕН        ║")
+        print(prefix .. " ╚══════════════════════════════════╝")
+        print(prefix .. "   Все функции и метатаблицы в норме.")
     end
-else
-    print("╔══════════════════════════════════╗")
-    print("║   ✅ ТАМПЕР НЕ ОБНАРУЖЕН        ║")
-    print("╚══════════════════════════════════╝")
-    print("  Все функции и метатаблицы в норме.")
 end
 
--- Мониторинг в реальном времени
+-- Первичная проверка
+runChecks()
+printResult(false)
+
+-- Мониторинг каждые 3 сек
 task.spawn(function()
     while true do
         task.wait(3)
-        isTampered = false
-        reasons = {}
         runChecks()
-        if isTampered then
-            warn("[AntiTamper] ⚠️ Изменение обнаружено в реальном времени!")
-            for _, r in ipairs(reasons) do
-                warn("  → " .. r)
-            end
-        end
+        printResult(true)
     end
 end)
